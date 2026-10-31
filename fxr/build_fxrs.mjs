@@ -90,8 +90,17 @@ function addTint(action, key, inverted = false) {
 // ParticleModifier color, ...), so the tint goes on exactly one factor: the ParticleModifier. Everything else that
 // feeds into it is only whitened. Lights and lens flares aren't particles and get the tint on their own colors.
 // Distortion colors stay as they are: they're neutral, and tinting them darkens the background into dark shapes.
-// Dark: particles subtract (whitened color x inverted tint) from the background, without the extra bloom glow;
-// lights and lens flares can only add light, so they keep the normal (dim) tint.
+// Dark: additive particles subtract (whitened color x inverted tint) from the background instead, without the extra
+// bloom glow. Alpha-blended ones (Normal, e.g. smoke) can already show dark colors, so they keep their blend mode and
+// the normal tint (subtracting them would darken their whole quad: dark squares). Lights and lens flares can only add
+// light, so they keep the normal (dim) tint too.
+// Blend modes that add light: Add, and Unk0 / Unk7 (the library documents both as behaving like Add).
+const ADDITIVE = new Set([BlendMode.Add, BlendMode.Unk0, BlendMode.Unk7])
+const blendModeOf = appearance => {
+  const mode = appearance.blendMode
+  return typeof mode === 'number' ? mode : mode?.value
+}
+
 function recolor(fxr, dark) {
   let tinted = 0
   for (const action of fxr.root.walkActions()) {
@@ -107,14 +116,15 @@ function recolor(fxr, dark) {
   for (const config of fxr.root.walkConfigs()) {
     const appearance = config.appearance
     if (!appearance?.$data?.isParticle || appearance.type === ActionType.Distortion) continue
-    if (dark) {
+    const subtract = dark && ADDITIVE.has(blendModeOf(appearance))
+    if (subtract) {
       appearance.blendMode = BlendMode.Subtract
       if ('bloom' in appearance.$data.props) appearance.bloom = false
     }
     if (!config.particleModifier) {
       config.particleModifier = new ParticleModifier()
     }
-    tinted += addTint(config.particleModifier, 'color', dark)
+    tinted += addTint(config.particleModifier, 'color', subtract)
   }
   return tinted
 }

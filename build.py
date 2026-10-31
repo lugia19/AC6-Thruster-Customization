@@ -52,14 +52,17 @@ FIELD_FORMATS = {'s8': '<b', 's32': '<i'}
 
 
 class Param:
-    """Raw .param file, fields located through WitchyBND's Paramdex defs, edited in place."""
+    """Raw .param file, fields located through WitchyBND's Paramdex defs (or `layout`, a list of (type, name) for
+    params without one), edited in place."""
 
-    def __init__(self, path, def_path):
+    def __init__(self, path, def_path=None, layout=None):
         self.path = path
         self.data = bytearray(open(path, "rb").read())
         self.fields, offset, bit_size, bits_used = {}, 0, None, 0
-        for field in ET.parse(def_path).getroot().iter("Field"):
-            typ, name, bits, count = re.match(r"(\w+)\s+(\w+)(?::(\d+))?(?:\[(\d+)\])?", field.get("Def")).groups()
+        defs = [f"{typ} {name}" for typ, name in layout] if layout else \
+            [field.get("Def") for field in ET.parse(def_path).getroot().iter("Field")]
+        for definition in defs:
+            typ, name, bits, count = re.match(r"(\w+)\s+(\w+)(?::(\d+))?(?:\[(\d+)\])?", definition).groups()
             size = FIELD_SIZES[typ]
             if bits:  # bitfields share a storage unit until it's full
                 if bit_size == size and bits_used + int(bits) <= size * 8:
@@ -76,7 +79,7 @@ class Param:
         # AC6 paramdefs can be stale: a def whose size doesn't match the rows would put fields at wrong offsets.
         starts = sorted(self.rows.values())
         strides = {b - a for a, b in zip(starts, starts[1:])}
-        assert strides <= {offset}, f"{os.path.basename(def_path)} describes {offset:#x}-byte rows, the param has {strides}"
+        assert strides <= {offset}, f"{os.path.basename(path)}: the layout has {offset:#x}-byte rows, the param {strides}"
 
     def get(self, row, field):
         offset, typ = self.fields[field]
@@ -133,15 +136,27 @@ def main():
     witchy(archives, [unpacked(a) for a in archives])
 
     params = unpacked(regulation)
+    # The generator-dependent effect tables: row = an effect the game spawns, column t (sfxId<t>) = what it uses for
+    # generator color type t, -1 = the row's own effect (e.g. row 1003010, the assault boost startup flare, has no
+    # columns: one flare for every type). Thrusters: the flames, which get custom twins. Replace (no paramdef, 8 s32
+    # columns): everything else that depends on the generator (assault armor, pulse armor...), which stays stock (the
+    # pulse shield is a model the tint can't reach).
     thrusters = Param(os.path.join(params, "ThrustersSfxIdParam_PC.param"), os.path.join(defs, "ThrustersSfxIdParam.xml"))
-    stock_flames = sorted({thrusters.get(row, f"sfxId{t}") for row in thrusters.rows for t in STOCK_COLOR_TYPES} - {-1})
+    replace = Param(os.path.join(params, "GeneratorTypeSfxIdRplace_PC.param"),
+                    layout=[("s32", f"sfxId{t}") for t in range(8)])
+
+    def effect_for(table, row, t):
+        sfx = table.get(row, f"sfxId{t}")
+        return sfx if sfx != -1 or row == 0 else row
+
+    effect_dir = os.path.join(unpacked(effects), "effect")
+    stock_flames = sorted({effect_for(thrusters, row, t) for row in thrusters.rows for t in STOCK_COLOR_TYPES} - {-1})
 
     # Custom flames: a wrapper per stock flame, plus tinted and dark variants of it (see fxr/build_fxrs.mjs).
     fxr_dir = os.path.join(ROOT, "fxr")
     shell = os.name == "nt"
     if not os.path.isdir(os.path.join(fxr_dir, "node_modules")):
         subprocess.run(["npm", "install"], cwd=fxr_dir, check=True, shell=shell)
-    effect_dir = os.path.join(unpacked(effects), "effect")
     id_map_path = os.path.join(WORK, "id_map.json")
     subprocess.run(["node", "build_fxrs.mjs", effect_dir, id_map_path, *map(str, stock_flames)], cwd=fxr_dir,
                    check=True, shell=shell)
@@ -155,15 +170,18 @@ def main():
         assert not os.path.exists(target), f"{new_id} collides with an existing effect"
         shutil.copy(os.path.join(reslists, f"f{source_id:09d}.ffxreslist"), target)
 
-    # Params: every thruster effect row gets its custom twins, and every player generator with a stock color type
-    # switches to that type's twin.
-    for row in thrusters.rows:
-        for t in STOCK_COLOR_TYPES:
-            assert thrusters.get(row, f"sfxId{t + CUSTOM_TYPE_SHIFT}") == -1, f"row {row}: column {t + CUSTOM_TYPE_SHIFT} in use"
-            stock = thrusters.get(row, f"sfxId{t}")
-            if stock != -1:
-                thrusters.set(row, f"sfxId{t + CUSTOM_TYPE_SHIFT}", twin_of[stock])
-    thrusters.save()
+    # Params: each custom type t+3 uses what stock type t uses, as its twin in the thruster table and unchanged in the
+    # replace table (or a Coral generator would fall back to the non-Coral versions), and every player generator with a
+    # stock color type switches to its custom type.
+    for table, mapping in [(thrusters, twin_of), (replace, {})]:
+        for row in table.rows:
+            for t in STOCK_COLOR_TYPES:
+                column = f"sfxId{t + CUSTOM_TYPE_SHIFT}"
+                assert table.get(row, column) == -1, f"{os.path.basename(table.path)} row {row}: {column} in use"
+                stock = effect_for(table, row, t)
+                if stock != -1:
+                    table.set(row, column, mapping.get(stock, stock))
+        table.save()
     generators = Param(os.path.join(params, "EquipParamGenerator.param"), os.path.join(defs, "EquipParamGenerator.xml"))
     switched = 0
     for row in generators.rows:
