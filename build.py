@@ -21,8 +21,8 @@ WORK = os.path.join(ROOT, "build")
 PACKAGE = os.path.join(ROOT, "package")
 
 # thrustersColorType N uses ThrustersSfxIdParam_PC column sfxIdN. Stock types 0-2 (blue, orange, Coral) get custom
-# twins 3-5 (unused in vanilla): copies of their flames that switch between the stock and the tinted look by camera
-# distance (see fxr/build_fxrs.mjs), so the player's AC, close to the camera, shows the color.
+# twins 3-5 (unused in vanilla): wrapper effects that play the stock flame, or a tinted or dark variant of it, by camera
+# distance and the color's darkness (see fxr/build_fxrs.mjs), so the player's AC, close to the camera, shows the color.
 STOCK_COLOR_TYPES = (0, 1, 2)
 CUSTOM_TYPE_SHIFT = 3
 # Player generators are 650xxxxx; the NPC versions (659xxxxx) are only used by special ACs and stay untouched.
@@ -136,7 +136,7 @@ def main():
     thrusters = Param(os.path.join(params, "ThrustersSfxIdParam_PC.param"), os.path.join(defs, "ThrustersSfxIdParam.xml"))
     stock_flames = sorted({thrusters.get(row, f"sfxId{t}") for row in thrusters.rows for t in STOCK_COLOR_TYPES} - {-1})
 
-    # Custom flames: copies of every stock flame with a tinted look switched by camera distance (see fxr/build_fxrs.mjs).
+    # Custom flames: a wrapper per stock flame, plus tinted and dark variants of it (see fxr/build_fxrs.mjs).
     fxr_dir = os.path.join(ROOT, "fxr")
     shell = os.name == "nt"
     if not os.path.isdir(os.path.join(fxr_dir, "node_modules")):
@@ -145,12 +145,14 @@ def main():
     id_map_path = os.path.join(WORK, "id_map.json")
     subprocess.run(["node", "build_fxrs.mjs", effect_dir, id_map_path, *map(str, stock_flames)], cwd=fxr_dir,
                    check=True, shell=shell)
-    twin_of = {source: int(new) for new, source in json.load(open(id_map_path)).items()}
-    # The new FXRs use their sources' textures and models. WitchyBND would generate empty resource lists for them.
+    id_map = json.load(open(id_map_path))
+    twin_of = {int(stock): wrapper for stock, wrapper in id_map["twins"].items()}
+    # The variants use their sources' textures and models. WitchyBND would generate empty resource lists for them (fine
+    # for the wrappers, which only hold proxies).
     reslists = os.path.join(unpacked(effects), "ResourceList")
-    for source_id, new_id in twin_of.items():
-        target = os.path.join(reslists, f"f{new_id:09d}.ffxreslist")
-        assert not os.path.exists(target), f"twin {new_id} collides with an existing effect"
+    for new_id, source_id in id_map["resources"].items():
+        target = os.path.join(reslists, f"f{int(new_id):09d}.ffxreslist")
+        assert not os.path.exists(target), f"{new_id} collides with an existing effect"
         shutil.copy(os.path.join(reslists, f"f{source_id:09d}.ffxreslist"), target)
 
     # Params: every thruster effect row gets its custom twins, and every player generator with a stock color type

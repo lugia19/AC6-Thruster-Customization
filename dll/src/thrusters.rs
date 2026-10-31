@@ -1,11 +1,12 @@
 //! Feeds the custom generator flames (fxr/build_fxrs.mjs) through FXR external values:
 //! - 900001-900003 (red, green, blue): the player's thruster color (lib.rs STORAGE_COLOR_OFFSET in the paint block),
-//!   served as 1 + a tint factor (1..2, see channel_value) so 0 keeps meaning "nothing provides this"
-//!   (no DLL).
+//!   served as 1 + a tint factor (1..2, see set_channels) so 0 keeps meaning "nothing provides this" (no DLL).
+//! - 900006: 1 while the color is dark (brightest channel below DARK_BELOW): the flames then play their dark variant,
+//!   which subtracts the inverted color from the background instead of adding light.
 //! - 9001X0 / 9001X1 / 9001X2: the min / near / far camera-distance thresholds in meters for flame family X (stock
-//!   effect IDs 4Xxxxx: 41 continuous/falling/end smoke, 43, 44 assault boost, 45 quick boost). Each flame compares
-//!   its own camera distance (game value 2000) against them: from min up to near it plays tinted, below min or above
-//!   far its stock look. The player's AC is the one in that band (the camera sits closer during assault boost); NPC
+//!   effect IDs 4Xxxxx: 41 continuous/falling/end smoke, 43, 44 assault boost, 45 quick boost). Each flame's wrapper
+//!   compares its own camera distance (game value 2000) against them: from min up to near it plays the tinted (or
+//!   dark) variant, below min or above far its stock look. The player's AC is the one in that band (the camera sits closer during assault boost); NPC
 //!   flames only turn tinted when they come that close (e.g. in melee). Thresholds come from Game\debug-logs\
 //!   paint_menu_thresholds.txt (lines "<family> <min> <near> <far>", e.g. "44 5 30 35", re-read every second), else
 //!   the defaults.
@@ -30,6 +31,9 @@ use crate::{Hook, STORAGE_COLOR_OFFSET, log, orig};
 
 const EXT_RED: i32 = 900001;
 const EXT_BLUE: i32 = 900003;
+const EXT_DARK: i32 = 900006;
+// Colors whose brightest channel (0-255) is below this use the dark variant.
+const DARK_BELOW: u32 = 80;
 // Family thresholds: EXT_THRESHOLDS_BASE + family * 10 + {0 min, 1 near, 2 far} (must match fxr/build_fxrs.mjs).
 const EXT_THRESHOLDS_BASE: i32 = 900100;
 const FAMILIES: usize = 10; // indexed by the family digit
@@ -60,10 +64,10 @@ const PAINT_DATA_OFFSET: usize = 0x788;
 const PAINT_BLOCK_OFFSET: usize = 0x14c;
 
 static ORIG_GET_EXT_VALUE: AtomicUsize = AtomicUsize::new(0);
-// 0xRRGGBB served to the flames.
-// Served values for 900001-900003 (red, green, blue), as f32 bits: 1 + linear channel (see channel_value). start()
-// fills in DEFAULT_COLOR until the poll thread reads the stored color.
+// Served values for 900001-900003 (red, green, blue) and 900006 (dark), as f32 bits (see set_channels). start() fills
+// in DEFAULT_COLOR until the poll thread reads the stored color.
 static CHANNELS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+static DARK: AtomicU32 = AtomicU32::new(0);
 // Per family: [min, near, far] as f32 bits. All 0 (= stock) until the poll thread's first reload.
 static THRESHOLDS: [[AtomicU32; 3]; FAMILIES] = [const { [const { AtomicU32::new(0) }; 3] }; FAMILIES];
 static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -102,6 +106,8 @@ unsafe extern "system" fn get_ext_value_impl(block: *mut u8, out: *mut u32, id: 
     }
     let value = if id <= EXT_BLUE {
         CHANNELS[(id - EXT_RED) as usize].load(Ordering::Relaxed)
+    } else if id == EXT_DARK {
+        DARK.load(Ordering::Relaxed)
     } else {
         let rel = id - EXT_THRESHOLDS_BASE;
         let (family, kind) = ((rel / 10) as usize, (rel % 10) as usize);
@@ -164,11 +170,16 @@ fn channel_value(c: u32, brightest: u32) -> f32 {
 }
 
 /// Serves a 0xRRGGBB color.
+/// Dark colors play the dark variant, which subtracts the inverted color: there the plain channel (c/255) keeps the
+/// hue visible. Others play the tinted variant (see channel_value).
 fn set_channels(rgb: u32) {
     let channels = [rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF];
     let brightest = channels.into_iter().max().unwrap_or(0);
+    let dark = brightest < DARK_BELOW;
+    DARK.store(if dark { 1.0f32 } else { 0.0 }.to_bits(), Ordering::Relaxed);
     for (slot, c) in CHANNELS.iter().zip(channels) {
-        slot.store(channel_value(c, brightest).to_bits(), Ordering::Relaxed);
+        let value = if dark { 1.0 + c as f32 / 255.0 } else { channel_value(c, brightest) };
+        slot.store(value.to_bits(), Ordering::Relaxed);
     }
 }
 

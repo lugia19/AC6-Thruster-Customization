@@ -1,48 +1,61 @@
-// Builds the custom generator flames: a copy of every given stock thruster FXR (and every FXR they reference) at
-// +ID_OFFSET. Each copy plays its stock look, or, while it's close to the camera (which in practice means it's on the
-// player's AC), a whitened version tinted by three custom external values (R, G, B): the player's thruster color
-// from the Paint screen. "Close" is the game's per-effect camera distance (external value 2000, meters) against
-// thresholds the paint-menu DLL serves per flame family (stock ID 4Xxxxx -> family X: 41 continuous/falling/end smoke,
-// 43, 44 assault boost, 45 quick boost; the camera sits closer during assault boost): from MIN up to NEAR the effect
-// turns tinted, above FAR or below MIN it turns stock again (the NEAR-FAR gap stops flickering at the boundary).
-// Without the DLL the thresholds read 0, so everything stays stock.
+// Builds the custom generator flames. For every given stock thruster FXR S:
+// - a wrapper at S + WRAPPER_OFFSET (what the params point at): a small effect whose states enable one of three child
+//   proxies: the stock S itself, a tinted variant, or a dark variant;
+// - variants at S + TINTED_OFFSET and S + DARK_OFFSET, plain copies of S (and of every FXR S references, remapped to
+//   the same variant) with their own, untouched states:
+//   - tinted: every color whitened to its brightness, tinted by three custom external values (R, G, B), the player's
+//     thruster color from the Paint screen;
+//   - dark: the same, but the particles subtract from the background (inverted tint), so dark colors darken instead of
+//     vanishing (additive flames can't get darker than what's behind them).
+// The wrapper plays stock unless it's close to the camera (which in practice means it's on the player's AC): the
+// game's per-effect camera distance (external value 2000, meters) against min/near/far thresholds the paint-menu DLL
+// serves per flame family (stock ID 4Xxxxx -> family X: 41 continuous/falling/end smoke, 43, 44 assault boost, 45
+// quick boost; the camera sits closer during assault boost). From MIN up to NEAR it switches to tinted, or to dark
+// while the DLL's dark-mode value (900006) is 1; above FAR or below MIN it goes back to stock (the NEAR-FAR gap stops
+// flickering at the boundary). Without the DLL every threshold reads 0, so everything stays stock.
 // Usage: node build_fxrs.mjs <unpacked sfxbnd_commoneffects effect dir> <id map json out> <stock FXR id...>
-// Writes the new FXRs into the same dir, and a {new id: source id} map (the new FXRs need the source's resource
-// lists).
+// Writes the new FXRs into the same dir, and a map {twins: {stock id: wrapper id}, resources: {new id: source id}}
+// (each new FXR needs its source's resource list; wrappers only hold proxies).
 import {
   ActionType,
+  BasicNode,
+  BlendMode,
   ConstantProperty,
   ExternalValue1Modifier,
   FXR,
   Game,
   Keyframe,
   LinearProperty,
-  NodeWithConfigs,
   ParticleModifier,
   ProxyNode,
   State,
-  StateCondition,
 } from '@cccode/fxr'
 import fs from 'node:fs'
 import path from 'node:path'
 
-// Custom external values, served by the DLL as channel + 1 (1 = channel off, 2 = channel full). 0 means nothing
-// provides them (no DLL), which the tint curve maps to "no tint", so the flames stay white instead of black.
+// Custom external values, served by the DLL as 1 + a 0..1 tint factor (1 = channel off, 2 = channel full). 0 means
+// nothing provides them (no DLL), which the tint curves map to "no tint".
 const EXT_RED = 900001
 const EXT_GREEN = 900002
 const EXT_BLUE = 900003
+// 1 while the player's color is dark enough for the dark variant (DLL), else 0.
+const EXT_DARK = 900006
 // The effect's distance from the camera in meters, provided by the game to almost every effect.
 const EXT_CAMERA_DISTANCE = 2000
+// The effect termination signal: the wrapper ends when the spawner says so, like the stock flames.
+const EXT_TERMINATE = 0
 // Tinting thresholds in meters, served by the DLL (live-tunable) per flame family X: 9001X0 min, 9001X1 near,
 // 9001X2 far (must match dll/src/thrusters.rs EXT_THRESHOLDS_BASE).
 const thresholdIds = family => {
   const base = 900100 + family * 10
   return { min: base, near: base + 1, far: base + 2 }
 }
-// Stock thruster IDs are 4Xxxxx (X = family); shared child effects get their own ID's family.
+// Stock thruster IDs are 4Xxxxx (X = family).
 const familyOf = stockId => Math.floor(stockId / 10000) % 10
 
-const ID_OFFSET = 9000000
+const WRAPPER_OFFSET = 9000000
+const TINTED_OFFSET = 9100000
+const DARK_OFFSET = 9200000
 
 // Keeps brightness and alpha, drops the hue: the tint supplies it.
 const whiten = ([r, g, b, a]) => {
@@ -50,22 +63,26 @@ const whiten = ([r, g, b, a]) => {
   return [m, m, m, a]
 }
 
-// Multiplier for one channel: 0 (no DLL) -> 1, 1 -> 0, 2 -> 1, linear in between.
-function channelTint(ext, channel) {
+// Multiplier for one channel. Tinted: 0 (no DLL) -> 1, 1 -> 0, 2 -> 1, linear in between. Inverted (what the dark
+// variant subtracts): 1 -> 1, 2 -> 0, so a dark channel removes a lot of that channel from the background.
+function channelTint(ext, channel, inverted) {
   const factor = v => [0, 1, 2, 3].map(i => (i === channel ? v : 1))
-  return new ExternalValue1Modifier(ext, new LinearProperty(false, [
-    new Keyframe(0, factor(1)),
-    new Keyframe(1, factor(0)),
-    new Keyframe(2, factor(1)),
-  ]))
+  const keyframes = inverted
+    ? [new Keyframe(0, factor(1)), new Keyframe(1, factor(1)), new Keyframe(2, factor(0))]
+    : [new Keyframe(0, factor(1)), new Keyframe(1, factor(0)), new Keyframe(2, factor(1))]
+  return new ExternalValue1Modifier(ext, new LinearProperty(false, keyframes))
 }
 
-function addTint(action, key) {
+function addTint(action, key, inverted = false) {
   if ('field' in action.$data.props[key]) return 0 // fields can't carry modifiers
   if (Array.isArray(action[key])) {
     action[key] = new ConstantProperty(action[key])
   }
-  action[key].modifiers.push(channelTint(EXT_RED, 0), channelTint(EXT_GREEN, 1), channelTint(EXT_BLUE, 2))
+  action[key].modifiers.push(
+    channelTint(EXT_RED, 0, inverted),
+    channelTint(EXT_GREEN, 1, inverted),
+    channelTint(EXT_BLUE, 2, inverted),
+  )
   return 1
 }
 
@@ -73,9 +90,11 @@ function addTint(action, key) {
 // ParticleModifier color, ...), so the tint goes on exactly one factor: the ParticleModifier. Everything else that
 // feeds into it is only whitened. Lights and lens flares aren't particles and get the tint on their own colors.
 // Distortion colors stay as they are: they're neutral, and tinting them darkens the background into dark shapes.
-function tintConfig(config) {
+// Dark: particles subtract (whitened color x inverted tint) from the background, without the extra bloom glow;
+// lights and lens flares can only add light, so they keep the normal (dim) tint.
+function recolor(fxr, dark) {
   let tinted = 0
-  for (const action of config.walkActions()) {
+  for (const action of fxr.root.walkActions()) {
     if (!action.$data || !('props' in action.$data) || action.type === ActionType.Distortion) continue
     for (const [key, meta] of Object.entries(action.$data.props)) {
       if (!('color' in meta)) continue
@@ -85,80 +104,95 @@ function tintConfig(config) {
       }
     }
   }
-  const appearance = config.appearance
-  if (appearance?.$data?.isParticle && appearance.type !== ActionType.Distortion) {
+  for (const config of fxr.root.walkConfigs()) {
+    const appearance = config.appearance
+    if (!appearance?.$data?.isParticle || appearance.type === ActionType.Distortion) continue
+    if (dark) {
+      appearance.blendMode = BlendMode.Subtract
+      if ('bloom' in appearance.$data.props) appearance.bloom = false
+    }
     if (!config.particleModifier) {
       config.particleModifier = new ParticleModifier()
     }
-    tinted += addTint(config.particleModifier, 'color')
+    tinted += addTint(config.particleModifier, 'color', dark)
   }
   return tinted
 }
 
-// Doubles the effect: states 0..k-1 keep the stock look, states k..2k-1 are the same states with tinted configs.
-// Every node gets tinted clones of its configs, mapped in the second half; each state also switches to its twin in
-// the other half when the camera distance crosses the family's thresholds. Conditions run in order and the first
-// true one wins, so "below MIN" goes first: in a stock state it keeps the effect where it is (a jump to itself).
-function addDistanceSwitch(fxr, family) {
-  const { min, near, far } = thresholdIds(family)
-  let tinted = 0
-  for (const node of fxr.root.walk()) {
-    if (!(node instanceof NodeWithConfigs)) continue
-    const count = node.configs.length
-    const clones = node.configs.map(config => config.clone())
-    for (const clone of clones) tinted += tintConfig(clone)
-    node.configs.push(...clones)
-    node.stateConfigMap = [...node.stateConfigMap, ...node.stateConfigMap.map(c => (c < 0 ? -1 : c + count))]
-  }
-  const k = fxr.states.length
-  const shifted = condition => {
-    const copy = condition.clone()
-    if (copy.state >= 0) copy.state += k
-    return copy
-  }
+// The wrapper for stock flame `stockId`: one child node per variant (a proxy to it), each enabled in one state.
+function wrapper(stockId) {
+  const { min, near, far } = thresholdIds(familyOf(stockId))
   const distance = `External(${EXT_CAMERA_DISTANCE})`
-  const stock = fxr.states.map((state, i) => new State([
-    ...state.conditions.map(c => c.clone()),
-    StateCondition.from(`${distance} < External(${min}) then ${i}`),
-    StateCondition.from(`${distance} < External(${near}) then ${k + i}`),
-  ]))
-  const tintedStates = fxr.states.map((state, i) => new State([
-    ...state.conditions.map(shifted),
-    StateCondition.from(`${distance} < External(${min}) then ${i}`),
-    StateCondition.from(`${distance} > External(${far}) then ${i}`),
-  ]))
-  fxr.states = [...stock, ...tintedStates]
-  return tinted
+  const terminate = `External(${EXT_TERMINATE}) >= 1 then terminate`
+  const STOCK = 0, TINTED = 1, DARK = 2
+  const states = [
+    State.from([terminate, `${distance} < External(${min}) then ${STOCK}`, `${distance} < External(${near}) then ${TINTED}`]),
+    State.from([
+      terminate,
+      `${distance} < External(${min}) then ${STOCK}`,
+      `${distance} > External(${far}) then ${STOCK}`,
+      `External(${EXT_DARK}) >= 1 then ${DARK}`,
+    ]),
+    State.from([
+      terminate,
+      `${distance} < External(${min}) then ${STOCK}`,
+      `${distance} > External(${far}) then ${STOCK}`,
+      `External(${EXT_DARK}) < 1 then ${TINTED}`,
+    ]),
+  ]
+  const child = (sfx, state) => new BasicNode([], [new ProxyNode(sfx)]).mapStates(...[0, 1, 2].map(s => (s === state ? 0 : -1)))
+  return new FXR(stockId + WRAPPER_OFFSET, states, [
+    child(stockId, STOCK),
+    child(stockId + TINTED_OFFSET, TINTED),
+    child(stockId + DARK_OFFSET, DARK),
+  ])
 }
 
-const [effectDir, idMapPath, ...stockIds] = process.argv.slice(2)
+const [effectDir, idMapPath, ...stockArgs] = process.argv.slice(2)
+const stockIds = stockArgs.map(Number)
 const file = id => path.join(effectDir, `f${String(id).padStart(9, '0')}.fxr`)
 
-// The stock flames and everything they reference through proxies.
+// Every stock flame and everything it references through proxies: each gets a tinted and a dark variant.
 // A path, not fs.readFileSync: small files come back as views into Node's shared buffer pool, which the library
 // reads from the pool's start.
-const fxrs = new Map()
-const pending = stockIds.map(Number)
+const sources = new Set()
+const pending = [...stockIds]
 while (pending.length) {
   const id = pending.pop()
-  if (fxrs.has(id)) continue
+  if (sources.has(id)) continue
+  sources.add(id)
   const fxr = await FXR.read(file(id), Game.ArmoredCore6)
-  fxrs.set(id, fxr)
   for (const node of fxr.root.walk()) {
     if (node instanceof ProxyNode) pending.push(node.sfx)
   }
 }
 
-for (const [oldId, fxr] of fxrs) {
-  fxr.id = oldId + ID_OFFSET
-  // The effect dir is a fresh unpack of the game's effects, so an existing file here is a stock effect.
-  if (fs.existsSync(file(fxr.id))) throw new Error(`twin ${fxr.id} of ${oldId} would overwrite an existing effect`)
-  for (const node of fxr.root.walk()) {
-    if (node instanceof ProxyNode) node.sfx += ID_OFFSET
-  }
-  const family = familyOf(oldId)
-  const tinted = addDistanceSwitch(fxr, family)
+// The effect dir is a fresh unpack of the game's effects, so an existing file at a new ID is a stock effect.
+async function save(fxr) {
+  if (fs.existsSync(file(fxr.id))) throw new Error(`${fxr.id} would overwrite an existing effect`)
   await fxr.saveAs(file(fxr.id), Game.ArmoredCore6)
-  console.log(`${oldId} -> ${fxr.id}: family 4${family}, ${fxr.states.length} states, ${tinted} colors tinted`)
 }
-fs.writeFileSync(idMapPath, JSON.stringify(Object.fromEntries([...fxrs.keys()].map(id => [id + ID_OFFSET, id])), null, 1))
+
+const resources = {}
+for (const sourceId of sources) {
+  for (const [offset, dark] of [[TINTED_OFFSET, false], [DARK_OFFSET, true]]) {
+    const fxr = await FXR.read(file(sourceId), Game.ArmoredCore6)
+    fxr.id = sourceId + offset
+    for (const node of fxr.root.walk()) {
+      if (node instanceof ProxyNode) node.sfx += offset
+    }
+    const tinted = recolor(fxr, dark)
+    await save(fxr)
+    resources[fxr.id] = sourceId
+    console.log(`${sourceId} -> ${fxr.id}: ${dark ? 'dark' : 'tinted'}, ${tinted} colors tinted`)
+  }
+}
+
+const twins = {}
+for (const stockId of stockIds) {
+  const fxr = wrapper(stockId)
+  await save(fxr)
+  twins[stockId] = fxr.id
+  console.log(`${stockId} -> ${fxr.id}: wrapper, family 4${familyOf(stockId)}`)
+}
+fs.writeFileSync(idMapPath, JSON.stringify({ twins, resources }, null, 1))
