@@ -1,0 +1,17 @@
+profileVersion = "v1"
+
+# paint-menu: a THRUSTER color row in the Paint screen; player generators' flames take that color near the camera.
+# Paths are relative to this file (the package folder build.py writes).
+
+# Modded play uses its own save: me3 copies the real save to this file on first launch and never touches the original.
+savefile = "PaintMenu.sl2"
+
+[[supports]]
+game = "armoredcore6"
+
+[[packages]]
+id = "paint-menu"
+path = 'mod'
+
+[[natives]]
+path = 'paint_menu.dll'

@@ -1,0 +1,9 @@
+# Build output (build.py)
+/build/
+/package/
+/dll/target*/
+/fxr/node_modules/
+__pycache__/
+
+# Local save backups from development
+/tests/
