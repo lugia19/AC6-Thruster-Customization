@@ -104,6 +104,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--game", required=True, help="the game's Game folder (with regulation.bin, sfx/ and menu/)")
     parser.add_argument("--witchy", required=True, help="WitchyBND.exe (3.x)")
+    parser.add_argument("--debug-parts", action="store_true",
+                        help="give every part of the custom flames an ID the DLL can hide live (paint_menu_hide.txt); "
+                             "writes build/parts.tsv, which lists them")
     args = parser.parse_args()
     defs = os.path.join(os.path.dirname(args.witchy), "Assets", "Paramdex", "AC6", "Defs")
 
@@ -158,8 +161,11 @@ def main():
     if not os.path.isdir(os.path.join(fxr_dir, "node_modules")):
         subprocess.run(["npm", "install"], cwd=fxr_dir, check=True, shell=shell)
     id_map_path = os.path.join(WORK, "id_map.json")
+    env = dict(os.environ)
+    if args.debug_parts:
+        env["PARTS_TSV"] = os.path.join(WORK, "parts.tsv")
     subprocess.run(["node", "build_fxrs.mjs", effect_dir, id_map_path, *map(str, stock_flames)], cwd=fxr_dir,
-                   check=True, shell=shell)
+                   check=True, shell=shell, env=env)
     id_map = json.load(open(id_map_path))
     twin_of = {int(stock): wrapper for stock, wrapper in id_map["twins"].items()}
     # The variants use their sources' textures and models. WitchyBND would generate empty resource lists for them (fine
