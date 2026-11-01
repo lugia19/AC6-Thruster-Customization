@@ -1,63 +1,23 @@
-//! Feeds the custom generator flames (fxr/build_fxrs.mjs) through FXR external values:
-//! - For the player's thruster color (lib.rs STORAGE_COLOR_OFFSET in the paint block), each as red, green, blue:
-//!   900001-900003 how much the additive copy of a flame adds, 900004-900006 how much the subtractive copy removes from
-//!   the background (both copies play together; see set_channels), 900007-900009 the plain color, for alpha-blended
-//!   particles (smoke), which can show it as is. 900010: the additive copy's opacity, which fades out for the darkest
-//!   colors (see add_opacity). Served as 1 + the amount (1..2) so 0 keeps meaning "nothing provides this" (no DLL).
-//! - 9001X0 / 9001X1: the min / near camera-distance thresholds in meters for flame family X (stock effect IDs
-//!   ..Xxxxx: 41 continuous/falling/end smoke, 43, 44 assault boost, 45 quick boost, 0 the assault boost startup
-//!   flare). Each flame's wrapper compares its own camera distance (game value 2000) against them once, when it spawns:
-//!   from min up to near it plays the custom copies for its whole life, else its stock look. The player's AC is the one
-//!   in that band; NPC flames only turn custom when they spawn that close (e.g. in melee). Thresholds come from
-//!   Game\debug-logs\paint_menu_thresholds.txt (lines "<family> <min> <near>", e.g. "43 5 40", re-read every second),
-//!   else the defaults.
+//! Feeds the custom generator flames (fxr/build_fxrs.mjs) the player's thruster color (lib.rs STORAGE_COLOR_OFFSET in
+//! the paint block) through FXR external values, red, green, blue each: 900001-900003 what the additive copy of a flame
+//! adds, 900004-900006 what the subtractive copy removes from the background (both copies play together; see
+//! set_channels), 900007-900009 the plain color, for alpha-blended particles (smoke). Served as 1 + the amount (1..2),
+//! so 0 keeps meaning "no DLL" (the flames' wrappers then play stock).
 //!
-//! - 901000+: debug part toggles (only in builds made with build.py --debug-parts, which lists the parts in
-//!   build/parts.tsv): IDs listed in Game\debug-logs\paint_menu_hide.txt (lines "901234" or "901000-901499", re-read
-//!   every second) read 2, which hides that part; the rest read the game's 0.
-//!
-//! Effects read external values through 0x142b56480, effectively `float *get(value_block, float *out, int id)`; the
-//! hook lets the game's lookup run, then overwrites the result for these IDs only.
-//!
-//! Tuning aid (only while Game\debug-logs\paint_menu_debug.txt exists at startup): every custom flame reads its
-//! family's min threshold first, so each such read also fetches that block's camera distance and counts it in the
-//! family's 1 m histogram, logged every 5 s (seconds since start, percentiles, occupied buckets). The defaults below
-//! come from such runs.
+//! Effects read external values through 0x142b56480, effectively `float *get(value_block, float *out, int id)`.
 //!
 //! The player's paint block: [[[GameDataMan]+8]+0x788] + 0x14C (verified in game: the Paint screen edits this block
 //! in place; CE table AC6_TGA labels its first section "Head" at 0x108 + 0x44). A polling thread finds GameDataMan,
 //! reads the chain with checked reads (it's null while loading) and caches the color for the hook.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::{Hook, STORAGE_COLOR_OFFSET, log, orig};
 
-// Red, green, blue of: 900001-900003 add, 900004-900006 remove, 900007-900009 plain; 900010 the add copy's opacity.
 const EXT_FIRST_CHANNEL: i32 = 900001;
-const EXT_LAST_CHANNEL: i32 = 900010;
-// Family thresholds: EXT_THRESHOLDS_BASE + family * 10 + {0 min, 1 near} (must match fxr/build_fxrs.mjs).
-const EXT_THRESHOLDS_BASE: i32 = 900100;
-const FAMILIES: usize = 10; // indexed by the family digit
-const EXT_CAMERA_DISTANCE: i32 = 2000;
-// Histogram buckets: 1 m each, the last one is "this far or more".
-const DISTANCE_BUCKETS: usize = 151;
+const CHANNEL_COUNT: usize = 9;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const RELOAD_INTERVAL_TICKS: u32 = 5; // 1 s
-const HISTOGRAM_INTERVAL_TICKS: u32 = 25; // 5 s
-// Default [min, near] in meters of camera distance (value 2000). Measured on the player's AC in AC Test: 41 continuous
-// 16-60 (21-39 cruising, higher with quick boosts), 43 17-33 (one 7 at spawn), 44 assault boost 18-29 once the camera
-// has closed in (but its flames spawn before that, so it uses the default), 45 quick boost 18-58; arena NPCs mostly
-// read 67-150+. Below min = probably between the camera and the player (stock).
-const DEFAULT_THRESHOLDS: [f32; 2] = [12.0, 62.0];
-const FAMILY_THRESHOLDS: [(usize, [f32; 2]); 1] = [(3, [5.0, 40.0])];
-const THRESHOLDS_FILE: &str = "paint_menu_thresholds.txt";
-// Debug part toggles (fxr/build_fxrs.mjs EXT_PARTS_BASE).
-const EXT_PARTS_BASE: i32 = 901000;
-const PARTS: usize = 128 * 64;
-const HIDE_FILE: &str = "paint_menu_hide.txt";
-const DEBUG_FILE: &str = "paint_menu_debug.txt";
 // 0xRRGGBB, for ACs whose thruster color was never set (section 9's colors are plain black then).
 const DEFAULT_COLOR: u32 = 0xFF3030;
 
@@ -71,17 +31,8 @@ const PAINT_DATA_OFFSET: usize = 0x788;
 const PAINT_BLOCK_OFFSET: usize = 0x14c;
 
 static ORIG_GET_EXT_VALUE: AtomicUsize = AtomicUsize::new(0);
-// Served values for 900001-900010 (add, remove, plain: red, green, blue each; add opacity), as f32 bits (see
-// set_channels). start() fills in DEFAULT_COLOR until the poll thread reads the stored color.
-static CHANNELS: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
-// Per family: [min, near] as f32 bits. All 0 (= stock) until the poll thread's first reload.
-static THRESHOLDS: [[AtomicU32; 2]; FAMILIES] = [const { [const { AtomicU32::new(0) }; 2] }; FAMILIES];
-static DEBUG: AtomicBool = AtomicBool::new(false);
-// Bit per debug part ID: hidden.
-static HIDDEN: [AtomicU64; PARTS / 64] = [const { AtomicU64::new(0) }; PARTS / 64];
-// Per family: camera distances read by the custom flames since the last histogram line (debug only).
-static DISTANCES: [[AtomicU32; DISTANCE_BUCKETS]; FAMILIES] =
-    [const { [const { AtomicU32::new(0) }; DISTANCE_BUCKETS] }; FAMILIES];
+// Served values for 900001-900009 (add, remove, plain: red, green, blue each), as f32 bits (see set_channels).
+static CHANNELS: [AtomicU32; CHANNEL_COUNT] = [const { AtomicU32::new(0) }; CHANNEL_COUNT];
 
 type GetExtValueFn = unsafe extern "system" fn(*mut u8, *mut u32, i32) -> *mut u32;
 
@@ -105,109 +56,99 @@ fn read<T: Copy + Default>(addr: usize) -> Option<T> {
     (ok != 0 && n == size_of::<T>()).then_some(v)
 }
 
-/// Called for every external value read of every effect: anything outside our IDs goes straight to the game after
-/// one comparison. Our own IDs don't need the game's lookup at all (nothing else provides them), so it's skipped.
+/// Called for every external value read of every effect. Our IDs don't need the game's lookup at all (nothing else
+/// provides them), so it's skipped for them.
 unsafe extern "system" fn get_ext_value_impl(block: *mut u8, out: *mut u32, id: i32) -> *mut u32 {
-    let orig = unsafe { orig::<GetExtValueFn>(&ORIG_GET_EXT_VALUE) };
-    if !(EXT_FIRST_CHANNEL..EXT_THRESHOLDS_BASE + FAMILIES as i32 * 10).contains(&id) || out.is_null() {
-        let part = id.wrapping_sub(EXT_PARTS_BASE) as usize;
-        if part < PARTS && !out.is_null() && HIDDEN[part / 64].load(Ordering::Relaxed) >> (part % 64) & 1 != 0 {
-            unsafe { *out = 2.0f32.to_bits() };
-            return out;
-        }
-        return unsafe { orig(block, out, id) };
+    let ours = (EXT_FIRST_CHANNEL..EXT_FIRST_CHANNEL + CHANNEL_COUNT as i32).contains(&id);
+    if !ours || out.is_null() {
+        return unsafe { orig::<GetExtValueFn>(&ORIG_GET_EXT_VALUE)(block, out, id) };
     }
-    let value = if id <= EXT_LAST_CHANNEL {
-        CHANNELS[(id - EXT_FIRST_CHANNEL) as usize].load(Ordering::Relaxed)
-    } else {
-        let rel = id - EXT_THRESHOLDS_BASE;
-        let (family, kind) = ((rel / 10) as usize, (rel % 10) as usize);
-        if rel < 0 || kind > 1 {
-            return unsafe { orig(block, out, id) };
-        }
-        if kind == 0 && DEBUG.load(Ordering::Relaxed) {
-            let mut distance = 0u32;
-            unsafe { orig(block, &mut distance, EXT_CAMERA_DISTANCE) };
-            let meters = f32::from_bits(distance);
-            if meters.is_finite() && meters >= 0.0 {
-                DISTANCES[family][(meters as usize).min(DISTANCE_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        THRESHOLDS[family][kind].load(Ordering::Relaxed)
-    };
-    unsafe { *out = value };
+    let channel = (id - EXT_FIRST_CHANNEL) as usize;
+    unsafe { *out = CHANNELS[channel].load(Ordering::Relaxed) };
     out
 }
 
+/// Whether `bytes` matches GAME_DATA_MAN_PATTERN (None = any byte).
+fn matches_pattern(bytes: &[u8]) -> bool {
+    GAME_DATA_MAN_PATTERN.iter().zip(bytes).all(|(expected, actual)| match expected {
+        Some(byte) => byte == actual,
+        None => true,
+    })
+}
+
+/// Finds GameDataMan's static pointer: the game exe's code section is searched for GAME_DATA_MAN_PATTERN, whose
+/// `mov rax,[rip+offset]` holds the pointer's address relative to the end of that instruction.
 fn find_game_data_man() -> Option<usize> {
+    // PE layout: the offset of the PE header is at 0x3c; in it, the section count at +6, the optional header's size at
+    // +0x14 and the section headers right after the optional header (at +0x18 + its size), 0x28 bytes each: name at +0,
+    // size at +8, address (relative to the module) at +12.
     let base = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let pe = base + read::<u32>(base + 0x3c)? as usize;
-    let sections = read::<u16>(pe + 6)? as usize;
-    let first_section = pe + 0x18 + read::<u16>(pe + 0x14)? as usize;
-    for i in 0..sections {
-        let header = first_section + i * 0x28;
-        if read::<[u8; 8]>(header)? != *b".text\0\0\0" {
+    let pe_header = base + read::<u32>(base + 0x3c)? as usize;
+    let section_count = read::<u16>(pe_header + 6)? as usize;
+    let optional_header_size = read::<u16>(pe_header + 0x14)? as usize;
+    let first_section = pe_header + 0x18 + optional_header_size;
+    for i in 0..section_count {
+        let section = first_section + i * 0x28;
+        if read::<[u8; 8]>(section)? != *b".text\0\0\0" {
             continue;
         }
-        let size = read::<u32>(header + 8)? as usize;
-        let start = base + read::<u32>(header + 12)? as usize;
-        let code = unsafe { std::slice::from_raw_parts(start as *const u8, size) };
-        let n = GAME_DATA_MAN_PATTERN.len();
-        let hit = code.windows(n).position(|w| GAME_DATA_MAN_PATTERN.iter().zip(w).all(|(p, b)| p.is_none_or(|p| p == *b)))?;
-        let rel = i32::from_le_bytes(code[hit + 3..hit + 7].try_into().ok()?);
-        return Some((start + hit + 7).wrapping_add_signed(rel as isize));
+        let code_size = read::<u32>(section + 8)? as usize;
+        let code_start = base + read::<u32>(section + 12)? as usize;
+        let code = unsafe { std::slice::from_raw_parts(code_start as *const u8, code_size) };
+
+        let hit = code.windows(GAME_DATA_MAN_PATTERN.len()).position(matches_pattern)?;
+        // The mov is 7 bytes; its last 4 are the offset from the next instruction to the pointer.
+        let mov_end = code_start + hit + 7;
+        let offset = i32::from_le_bytes(code[hit + 3..hit + 7].try_into().ok()?);
+        return Some(mov_end.wrapping_add_signed(offset as isize));
     }
     None
 }
 
 /// The stored thruster color (a u32 of RGBA bytes), if the player's paint chain resolves right now.
 fn stored_color(game_data_man: usize) -> Option<u32> {
-    let player = read::<usize>(read::<usize>(game_data_man)? + PLAYER_DATA_OFFSET)?;
-    let paint = read::<usize>(player + PAINT_DATA_OFFSET).filter(|&p| p != 0)?;
+    let game_data = read::<usize>(game_data_man)?;
+    let player = read::<usize>(game_data + PLAYER_DATA_OFFSET)?;
+    let paint = read::<usize>(player + PAINT_DATA_OFFSET)?;
+    if paint == 0 {
+        return None;
+    }
     read::<u32>(paint + PAINT_BLOCK_OFFSET + STORAGE_COLOR_OFFSET)
 }
 
-/// How bright a color counts as, from its brightest 0-255 channel: 0 = dark (at or below 64), 1 = bright (at or above
-/// 160), smoothstep in between.
-fn brightness(brightest: u32) -> f32 {
-    let t = ((brightest as f32 - 64.0) / 96.0).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+/// sRGB (what the color picker shows) to linear light.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
-/// What the additive copy adds of one 0-255 channel. Bright colors use the plain factor c/255 (what looked right in
-/// game). The flames multiply it into HDR colors up to ~50 in the brightest stock parts, so a dark pick like #050505
-/// (0.02 per channel) would still leave those above 1 in every channel: white. Dark colors therefore use the channel's
-/// linear intensity (#050505 -> 0.0015), blended in as the color gets darker (see brightness).
-fn add_amount(c: u32, bright: f32) -> f32 {
-    let s = c as f32 / 255.0;
-    let linear = if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) };
-    linear + (s - linear) * bright
+/// How bright a color counts as, from its brightest channel (0-1): 0 = dark (64/255 or less), 1 = bright (160/255 or
+/// more), smoothly in between.
+fn brightness(brightest: f32) -> f32 {
+    let t = ((brightest * 255.0 - 64.0) / 96.0).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t) // smoothstep
 }
 
-/// What the subtractive copy removes from the background of one 0-255 channel: what the color lacks (1 - c/255),
-/// faded in as the color gets darker. Additive flames can't get darker than their background, so a dark color darkens
-/// it in the channels it lacks (dark red: mostly green and blue). Bright colors remove nothing: they look as before.
-fn remove_amount(c: u32, bright: f32) -> f32 {
-    (1.0 - c as f32 / 255.0) * (1.0 - bright)
-}
-
-/// The additive copy's opacity: 1, fading to 0 as the color's brightest channel drops from 64 to 16. Parts of the stock
-/// flames keep the generator's hue whatever their color properties say (textures, models), so a near-black color would
-/// still add a faint blue or red glow; this way the darkest colors only darken.
-fn add_opacity(brightest: u32) -> f32 {
-    ((brightest as f32 - 16.0) / 48.0).clamp(0.0, 1.0)
-}
-
-/// Serves a 0xRRGGBB color: both copies of each flame play together, so there's no switch between looks.
+/// Serves a 0xRRGGBB color: for each channel c (0-1),
+/// - add (900001-900003): c for bright colors (what looked right in game); for dark ones its linear intensity, since the
+///   flames multiply it into HDR colors up to ~50 (#050505 at 0.02 would still leave those above 1: white);
+/// - remove (900004-900006): what the color lacks (1 - c), for dark colors only (additive flames can't get darker than
+///   their background, so dark red darkens it in green and blue);
+/// - plain (900007-900009): c.
+///
+/// Each is served as 1 + the value.
 fn set_channels(rgb: u32) {
-    let channels = [rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF];
-    let brightest = channels.into_iter().max().unwrap_or(0);
-    let bright = brightness(brightest);
-    CHANNELS[9].store((1.0 + add_opacity(brightest)).to_bits(), Ordering::Relaxed);
-    for (i, c) in channels.into_iter().enumerate() {
-        CHANNELS[i].store((1.0 + add_amount(c, bright)).to_bits(), Ordering::Relaxed);
-        CHANNELS[i + 3].store((1.0 + remove_amount(c, bright)).to_bits(), Ordering::Relaxed);
-        CHANNELS[i + 6].store((1.0 + c as f32 / 255.0).to_bits(), Ordering::Relaxed);
+    let red = (rgb >> 16 & 0xFF) as f32 / 255.0;
+    let green = (rgb >> 8 & 0xFF) as f32 / 255.0;
+    let blue = (rgb & 0xFF) as f32 / 255.0;
+    let bright = brightness(red.max(green).max(blue));
+    for (i, c) in [red, green, blue].into_iter().enumerate() {
+        let linear = srgb_to_linear(c);
+        let add = linear + (c - linear) * bright;
+        let remove = (1.0 - c) * (1.0 - bright);
+        let plain = c;
+        CHANNELS[i].store((1.0 + add).to_bits(), Ordering::Relaxed);
+        CHANNELS[3 + i].store((1.0 + remove).to_bits(), Ordering::Relaxed);
+        CHANNELS[6 + i].store((1.0 + plain).to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -218,157 +159,26 @@ fn to_rgb(stored: u32) -> u32 {
     if rgb == 0 { DEFAULT_COLOR } else { rgb }
 }
 
-/// One "<family> <min> <near>" line (family as 4X or X; meters); None if malformed.
-fn parse_threshold_line(line: &str) -> Option<(usize, [f32; 2])> {
-    let mut parts = line.split_whitespace();
-    let family: usize = parts.next()?.parse().ok()?;
-    let family = if (40..50).contains(&family) { family - 40 } else { family };
-    let values: Vec<f32> = parts.map(|p| p.parse().ok()).collect::<Option<_>>()?;
-    let [min, near] = values.try_into().ok()?;
-    (family < FAMILIES && min <= near).then_some((family, [min, near]))
-}
-
-/// Re-reads the thresholds file when it changes; families it doesn't list (or a missing file) get the defaults.
-fn reload_thresholds(path: &Path, last_modified: &mut Option<SystemTime>) {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    if modified == *last_modified {
+fn poll_loop() {
+    let Some(game_data_man) = find_game_data_man() else {
+        log("thrusters: GameDataMan pattern not found, flames stay at the default color");
         return;
-    }
-    *last_modified = modified;
-    let mut table = [DEFAULT_THRESHOLDS; FAMILIES];
-    for (family, values) in FAMILY_THRESHOLDS {
-        table[family] = values;
-    }
-    let mut from_file = Vec::new();
-    for line in std::fs::read_to_string(path).unwrap_or_default().lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match parse_threshold_line(line) {
-            Some((family, values)) => {
-                table[family] = values;
-                from_file.push(family);
-            }
-            None => log(&format!("thrusters: ignored threshold line {line:?} (want \"<family> <min> <near>\")")),
-        }
-    }
-    for (slots, values) in THRESHOLDS.iter().zip(table) {
-        for (slot, value) in slots.iter().zip(values) {
-            slot.store(value.to_bits(), Ordering::Relaxed);
-        }
-    }
-    let describe = |family: usize| {
-        let [min, near] = table[family];
-        let source = if from_file.contains(&family) { "file" } else { "default" };
-        format!("{family}: {min}-{near} ({source})")
     };
-    let mut listed: Vec<usize> = FAMILY_THRESHOLDS.iter().map(|&(f, _)| f).chain(from_file.iter().copied()).collect();
-    listed.sort_unstable();
-    listed.dedup();
-    let [min, near] = DEFAULT_THRESHOLDS;
-    let others = format!("others: {min}-{near}");
-    let summary: Vec<String> = listed.into_iter().map(describe).chain([others]).collect();
-    log(&format!("thrusters: custom when spawned from min up to near, in m: {}", summary.join("; ")));
-}
-
-/// Re-reads the debug hide list when it changes: lines "<id>" or "<first>-<last>" (901000+), '#' comments.
-fn reload_hidden(path: &Path, last_modified: &mut Option<SystemTime>) {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    if modified == *last_modified {
-        return;
-    }
-    *last_modified = modified;
-    let mut bits = [0u64; PARTS / 64];
-    let mut count = 0;
-    for line in std::fs::read_to_string(path).unwrap_or_default().lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (a, b) = line.split_once('-').unwrap_or((line, line));
-        let (Ok(a), Ok(b)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) else {
-            log(&format!("thrusters: ignored hide line {line:?} (want \"<id>\" or \"<first>-<last>\")"));
-            continue;
-        };
-        for id in a.max(EXT_PARTS_BASE)..=b.min(EXT_PARTS_BASE + PARTS as i32 - 1) {
-            let part = (id - EXT_PARTS_BASE) as usize;
-            bits[part / 64] |= 1 << (part % 64);
-            count += 1;
-        }
-    }
-    for (slot, value) in HIDDEN.iter().zip(bits) {
-        slot.store(value, Ordering::Relaxed);
-    }
-    log(&format!("thrusters: hiding {count} debug parts"));
-}
-
-/// Logs and resets one family's camera distance histogram (nothing if its flames weren't evaluated).
-fn log_family_distances(family: usize, start: Instant) {
-    let counts: Vec<u32> = DISTANCES[family].iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
-    let total: u64 = counts.iter().map(|&c| c as u64).sum();
-    if total == 0 {
-        return;
-    }
-    let percentile = |p: f64| {
-        let target = (total as f64 * p).ceil().max(1.0) as u64;
-        let mut seen = 0;
-        counts.iter().position(|&c| {
-            seen += c as u64;
-            seen >= target
-        })
-    };
-    let fmt = |i: Option<usize>| i.map_or("?".to_string(), |i| if i == DISTANCE_BUCKETS - 1 { format!("{i}+") } else { i.to_string() });
-    let buckets: Vec<String> = counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| format!("{i}:{c}")).collect();
-    log(&format!(
-        "distances {family} @{:.0}s: {total} reads, min {} p10 {} median {} p90 {} max {} m | {}",
-        start.elapsed().as_secs_f32(),
-        fmt(percentile(0.0)),
-        fmt(percentile(0.1)),
-        fmt(percentile(0.5)),
-        fmt(percentile(0.9)),
-        fmt(counts.iter().rposition(|&c| c > 0)),
-        buckets.join(" ")
-    ));
-}
-
-fn poll_loop(log_dir: PathBuf) {
-    let start = Instant::now();
-    let thresholds_path = log_dir.join(THRESHOLDS_FILE);
-    let mut thresholds_modified = Some(SystemTime::UNIX_EPOCH); // forces the first load
-    reload_thresholds(&thresholds_path, &mut thresholds_modified);
-    let hide_path = log_dir.join(HIDE_FILE);
-    let mut hide_modified = None; // a missing file hides nothing, like the initial state
-    reload_hidden(&hide_path, &mut hide_modified);
-    // Without it the flames keep the default color, but threshold reloads and histograms still run.
-    let game_data_man = find_game_data_man();
-    match game_data_man {
-        Some(addr) => log(&format!("thrusters: GameDataMan at {addr:#x}")),
-        None => log("thrusters: GameDataMan pattern not found, flames stay at the default color"),
-    }
+    log(&format!("thrusters: GameDataMan at {game_data_man:#x}"));
     let mut last = None;
-    for tick in 1u32.. {
+    loop {
         std::thread::sleep(POLL_INTERVAL);
-        if tick % RELOAD_INTERVAL_TICKS == 0 {
-            reload_thresholds(&thresholds_path, &mut thresholds_modified);
-            reload_hidden(&hide_path, &mut hide_modified);
-        }
-        if tick % HISTOGRAM_INTERVAL_TICKS == 0 && DEBUG.load(Ordering::Relaxed) {
-            (0..FAMILIES).for_each(|family| log_family_distances(family, start));
-        }
-        let Some(stored) = game_data_man.and_then(stored_color) else { continue };
-        let rgb = to_rgb(stored);
-        set_channels(rgb);
+        let Some(stored) = stored_color(game_data_man) else { continue };
         if last != Some(stored) {
             last = Some(stored);
+            let rgb = to_rgb(stored);
+            set_channels(rgb);
             log(&format!("thrusters: player's stored color {stored:08x} -> flames #{rgb:06X}"));
         }
     }
 }
 
-pub(crate) fn start(log_dir: PathBuf) {
+pub(crate) fn start() {
     set_channels(DEFAULT_COLOR);
-    if log_dir.join(DEBUG_FILE).exists() {
-        DEBUG.store(true, Ordering::Relaxed);
-        log("thrusters: debug on, logging camera distance histograms");
-    }
-    std::thread::spawn(move || poll_loop(log_dir));
+    std::thread::spawn(poll_loop);
 }

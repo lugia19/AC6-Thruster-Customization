@@ -20,9 +20,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, "build")
 PACKAGE = os.path.join(ROOT, "package")
 
-# thrustersColorType N uses ThrustersSfxIdParam_PC column sfxIdN. Stock types 0-2 (blue, orange, Coral) get custom
-# twins 3-5 (unused in vanilla): wrapper effects that play the stock flame, or a tinted or dark variant of it, by camera
-# distance and the color's darkness (see fxr/build_fxrs.mjs), so the player's AC, close to the camera, shows the color.
+# thrustersColorType N uses ThrustersSfxIdParam_PC column sfxIdN. Stock types 0-2 (orange, blue, Coral) get custom
+# types 3-5 (unused in vanilla), whose flames are wrappers that play the stock flame or custom copies tinted with the
+# player's color, depending on how close to the camera they spawn (see fxr/build_fxrs.mjs).
 STOCK_COLOR_TYPES = (0, 1, 2)
 CUSTOM_TYPE_SHIFT = 3
 # Player generators are 650xxxxx; the NPC versions (659xxxxx) are only used by special ACs and stay untouched.
@@ -58,28 +58,47 @@ class Param:
     def __init__(self, path, def_path=None, layout=None):
         self.path = path
         self.data = bytearray(open(path, "rb").read())
-        self.fields, offset, bit_size, bits_used = {}, 0, None, 0
-        defs = [f"{typ} {name}" for typ, name in layout] if layout else \
-            [field.get("Def") for field in ET.parse(def_path).getroot().iter("Field")]
-        for definition in defs:
+
+        # Field definitions like "s32 sfxId0", "u8 flag:1" (a bitfield) or "dummy8 pad[4]" (an array).
+        if layout:
+            definitions = [f"{typ} {name}" for typ, name in layout]
+        else:
+            definitions = [field.get("Def") for field in ET.parse(def_path).getroot().iter("Field")]
+
+        # Lay the fields out in order. Consecutive bitfields of the same type share one storage unit until it's full.
+        self.fields = {}  # name -> (offset in the row, type)
+        offset = 0
+        bitfield_unit_size = None  # size of the storage unit the current run of bitfields is filling
+        bits_used = 0
+        for definition in definitions:
             typ, name, bits, count = re.match(r"(\w+)\s+(\w+)(?::(\d+))?(?:\[(\d+)\])?", definition).groups()
             size = FIELD_SIZES[typ]
-            if bits:  # bitfields share a storage unit until it's full
-                if bit_size == size and bits_used + int(bits) <= size * 8:
+            if bits:
+                fits_in_current_unit = bitfield_unit_size == size and bits_used + int(bits) <= size * 8
+                if fits_in_current_unit:
                     bits_used += int(bits)
-                    continue
-                bit_size, bits_used = size, int(bits)
-                offset += size
+                else:
+                    bitfield_unit_size = size
+                    bits_used = int(bits)
+                    offset += size
                 continue
-            bit_size = None
+            bitfield_unit_size = None
             self.fields[name] = (offset, typ)
             offset += size * (int(count) if count else 1)
+        row_size = offset
+
+        # The row table: row_count entries of 0x18 bytes from 0x40, each an s32 row ID, 4 bytes of padding and the u64
+        # offset of the row's data.
         row_count = struct.unpack_from("<H", self.data, 0xA)[0]
-        self.rows = dict(struct.unpack_from("<i4xQ", self.data, 0x40 + i * 0x18) for i in range(row_count))
+        self.rows = {}  # row ID -> data offset
+        for i in range(row_count):
+            row_id, data_offset = struct.unpack_from("<i4xQ", self.data, 0x40 + i * 0x18)
+            self.rows[row_id] = data_offset
+
         # AC6 paramdefs can be stale: a def whose size doesn't match the rows would put fields at wrong offsets.
         starts = sorted(self.rows.values())
         strides = {b - a for a, b in zip(starts, starts[1:])}
-        assert strides <= {offset}, f"{os.path.basename(path)}: the layout has {offset:#x}-byte rows, the param {strides}"
+        assert strides <= {row_size}, f"{os.path.basename(path)}: the layout has {row_size:#x}-byte rows, the param {strides}"
 
     def get(self, row, field):
         offset, typ = self.fields[field]
@@ -104,9 +123,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--game", required=True, help="the game's Game folder (with regulation.bin, sfx/ and menu/)")
     parser.add_argument("--witchy", required=True, help="WitchyBND.exe (3.x)")
-    parser.add_argument("--debug-parts", action="store_true",
-                        help="give every part of the custom flames an ID the DLL can hide live (paint_menu_hide.txt); "
-                             "writes build/parts.tsv, which lists them")
     args = parser.parse_args()
     defs = os.path.join(os.path.dirname(args.witchy), "Assets", "Paramdex", "AC6", "Defs")
 
@@ -141,9 +157,8 @@ def main():
     params = unpacked(regulation)
     # The generator-dependent effect tables: row = an effect the game spawns, column t (sfxId<t>) = what it uses for
     # generator color type t, -1 = the row's own effect (e.g. row 1003010, the assault boost startup flare, has no
-    # columns: one flare for every type). Thrusters: the flames, which get custom twins. Replace (no paramdef, 8 s32
-    # columns): everything else that depends on the generator (assault armor, pulse armor...), which stays stock (the
-    # pulse shield is a model the tint can't reach).
+    # columns: one flare for every type). Thrusters: the flames, which get custom wrappers. Replace (no paramdef, 8 s32
+    # columns): everything else that depends on the generator (assault armor, pulse armor...), which stays stock.
     thrusters = Param(os.path.join(params, "ThrustersSfxIdParam_PC.param"), os.path.join(defs, "ThrustersSfxIdParam.xml"))
     replace = Param(os.path.join(params, "GeneratorTypeSfxIdRplace_PC.param"),
                     layout=[("s32", f"sfxId{t}") for t in range(8)])
@@ -155,20 +170,17 @@ def main():
     effect_dir = os.path.join(unpacked(effects), "effect")
     stock_flames = sorted({effect_for(thrusters, row, t) for row in thrusters.rows for t in STOCK_COLOR_TYPES} - {-1})
 
-    # Custom flames: a wrapper per stock flame, plus tinted and dark variants of it (see fxr/build_fxrs.mjs).
+    # Custom flames: a wrapper per stock flame, plus its two custom copies (see fxr/build_fxrs.mjs).
     fxr_dir = os.path.join(ROOT, "fxr")
     shell = os.name == "nt"
     if not os.path.isdir(os.path.join(fxr_dir, "node_modules")):
         subprocess.run(["npm", "install"], cwd=fxr_dir, check=True, shell=shell)
     id_map_path = os.path.join(WORK, "id_map.json")
-    env = dict(os.environ)
-    if args.debug_parts:
-        env["PARTS_TSV"] = os.path.join(WORK, "parts.tsv")
     subprocess.run(["node", "build_fxrs.mjs", effect_dir, id_map_path, *map(str, stock_flames)], cwd=fxr_dir,
-                   check=True, shell=shell, env=env)
+                   check=True, shell=shell)
     id_map = json.load(open(id_map_path))
-    twin_of = {int(stock): wrapper for stock, wrapper in id_map["twins"].items()}
-    # The variants use their sources' textures and models. WitchyBND would generate empty resource lists for them (fine
+    wrapper_of = {int(stock): wrapper for stock, wrapper in id_map["wrappers"].items()}
+    # The copies use their sources' textures and models. WitchyBND would generate empty resource lists for them (fine
     # for the wrappers, which only hold proxies).
     reslists = os.path.join(unpacked(effects), "ResourceList")
     for new_id, source_id in id_map["resources"].items():
@@ -176,10 +188,10 @@ def main():
         assert not os.path.exists(target), f"{new_id} collides with an existing effect"
         shutil.copy(os.path.join(reslists, f"f{source_id:09d}.ffxreslist"), target)
 
-    # Params: each custom type t+3 uses what stock type t uses, as its twin in the thruster table and unchanged in the
-    # replace table (or a Coral generator would fall back to the non-Coral versions), and every player generator with a
-    # stock color type switches to its custom type.
-    for table, mapping in [(thrusters, twin_of), (replace, {})]:
+    # Params: each custom type t+3 uses what stock type t uses, as its wrapper in the thruster table and unchanged in
+    # the replace table (or a Coral generator would fall back to the non-Coral versions), and every player generator
+    # with a stock color type switches to its custom type.
+    for table, mapping in [(thrusters, wrapper_of), (replace, {})]:
         for row in table.rows:
             for t in STOCK_COLOR_TYPES:
                 column = f"sfxId{t + CUSTOM_TYPE_SHIFT}"
@@ -197,7 +209,7 @@ def main():
             switched += 1
     assert switched, "no generator had a stock thruster color type"
     generators.save()
-    print(f"{switched} player generators switched to their custom flame twins")
+    print(f"{switched} player generators switched to their custom flames")
 
     # The row's label, in every language's menu text (FMG -> XML, insert after DEVICE, XML -> FMG).
     label_fmgs = {}

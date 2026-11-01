@@ -31,7 +31,7 @@ mod thrusters;
 
 use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use retour::RawDetour;
@@ -65,7 +65,6 @@ static ORIG_EDITED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static ORIG_SET_COLOR: AtomicUsize = AtomicUsize::new(0);
 static ORIG_GET_COLOR: AtomicUsize = AtomicUsize::new(0);
 static ORIG_WRITE_COLORS: AtomicUsize = AtomicUsize::new(0);
-static LOGGED_EDITOR: AtomicBool = AtomicBool::new(false);
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
 
 pub(crate) fn log(msg: &str) {
@@ -97,7 +96,6 @@ unsafe extern "system" fn slot_list_impl(out: *mut SlotRange, caller: usize) -> 
     let result = unsafe { orig::<unsafe extern "system" fn(*mut SlotRange) -> *mut SlotRange>(&ORIG_SLOT_LIST)(out) };
     if caller == ROW_BUILDER_SLOT_LIST_RET {
         unsafe { *out = range(&SLOTS) };
-        log("row builder: slot list with the extra slot");
     }
     result
 }
@@ -126,11 +124,10 @@ unsafe extern "system" fn edited_slots_impl(list: *const usize, out: *mut SlotRa
     type EditedSlotsFn = unsafe extern "system" fn(*const usize, *mut SlotRange) -> *mut SlotRange;
     let result = unsafe { orig::<EditedSlotsFn>(&ORIG_EDITED_SLOTS)(list, out) };
     // Unknown kinds (pattern, weathering, ours) get an empty range; only then check whether it's ours.
-    if unsafe { (*out)[0] == (*out)[1] } && current_row_kind(unsafe { *list }) == EXTRA_SLOT as i32 {
+    let [start, end] = unsafe { *out };
+    let no_slots = start == end;
+    if no_slots && current_row_kind(unsafe { *list }) == EXTRA_SLOT as i32 {
         unsafe { *out = range(&EXTRA_SLOT_LIST) };
-        if !LOGGED_EDITOR.swap(true, Ordering::Relaxed) {
-            log("editor: extra row edits the extra slot (logged once)");
-        }
     }
     result
 }
@@ -139,16 +136,11 @@ fn ctx_paint(ctx: usize) -> usize {
     unsafe { *((ctx + CTX_PAINT_OFFSET) as *const usize) }
 }
 
-fn storage_color_ptr(paint: usize) -> *const u32 {
-    (paint + STORAGE_COLOR_OFFSET) as *const u32
-}
-
 unsafe extern "system" fn set_color_impl(ctx: usize, slot: u8, color: u32) {
     if slot != EXTRA_SLOT {
         return unsafe { orig::<unsafe extern "system" fn(usize, u8, u32)>(&ORIG_SET_COLOR)(ctx, slot, color) };
     }
-    // The game's own writer (its trampoline, so past our guard), aimed at the storage section only. (thrusters.rs logs
-    // the stored color when it changes, at most every poll.)
+    // The game's own writer (its trampoline, so past our guard), aimed at the storage section only.
     let paint = ctx_paint(ctx);
     unsafe { orig::<WriteColorsFn>(&ORIG_WRITE_COLORS)(paint, &range(&STORAGE_SECTIONS), STORAGE_SLOT, color) };
 }
@@ -158,7 +150,7 @@ unsafe extern "system" fn get_color_impl(ctx: usize, out: *mut u32, slot: u8, ca
         type GetColorFn = unsafe extern "system" fn(usize, *mut u32, u8, u8) -> *mut u32;
         return unsafe { orig::<GetColorFn>(&ORIG_GET_COLOR)(ctx, out, slot, category) };
     }
-    unsafe { *out = *storage_color_ptr(ctx_paint(ctx)) };
+    unsafe { *out = *((ctx_paint(ctx) + STORAGE_COLOR_OFFSET) as *const u32) };
     out
 }
 
@@ -217,19 +209,13 @@ fn init() {
         .and_then(|p| p.parent().map(|p| p.join("debug-logs")))
         .unwrap_or_else(|| "debug-logs".into());
     let _ = std::fs::create_dir_all(&dir);
-    // Appended to, so restarting the game for a persistence test keeps the previous session's lines.
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("paint_menu.log")) {
+    if let Ok(f) = File::create(dir.join("paint_menu.log")) {
         let _ = LOG.set(Mutex::new(f));
     }
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    log(&format!("---- session start (unix ms {unix_ms})"));
     match install() {
         Ok(()) => {
             log("hooks installed");
-            thrusters::start(dir);
+            thrusters::start();
         }
         Err(e) => log(&format!("not hooked: {e}")),
     }
