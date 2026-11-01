@@ -32,18 +32,10 @@ import path from 'node:path'
 const EXT_ADD = 900001 // what the add copy adds
 const EXT_REMOVE = 900004 // what the remove copy subtracts
 const EXT_PLAIN = 900007 // the plain color, for alpha-blended particles
-// Camera distances in meters (at spawn) in which a flame plays custom, [min, near], by family X (stock ID ..Xxxxx: 41
-// continuous/falling/end smoke, 43, 44 assault boost, 45 quick boost, 0 the assault boost startup flare). Measured on
-// the player's AC in AC Test: 41 16-60, 43 17-33, 44 18-29 once the camera has closed in (its flames spawn before
-// that), 45 18-58; arena NPCs mostly 67-150+. Below min = probably between the camera and the player.
-const DISTANCES = { 3: [5, 40] }
-const DEFAULT_DISTANCES = [12, 62]
-function distancesFor(stockId) {
-  const family = Math.floor(stockId / 10000) % 10
-  return DISTANCES[family] ?? DEFAULT_DISTANCES
-}
-// Game values: the effect's distance from the camera in meters, and the spawner's termination signal.
-const EXT_CAMERA_DISTANCE = 2000
+// Whether the flame is on the player's AC (dll/src/player_flames.rs): 0 not known yet (or no DLL), 1 someone else's,
+// 2 the player's.
+const EXT_PLAYERS_FLAME = 900010
+// Game value: the spawner's termination signal.
 const EXT_TERMINATE = 0
 
 const WRAPPER_OFFSET = 9000000
@@ -156,21 +148,19 @@ function recolor(fxr, remove) {
 // flame, CUSTOM both copies. The choice is made once, at spawn, and kept: a proxy's effect keeps playing after its node
 // is disabled (switching from stock to custom left the stock flame running under the custom one), so a wrapper may
 // only ever enable one of them. Conditions are checked in order, first match wins:
-// - DECIDING (shows nothing): no DLL (its color values read 0) -> STOCK; camera distance at or past NEAR -> STOCK; from
-//   MIN -> CUSTOM; still closer than MIN after 0.1 s -> STOCK (also covers a distance that isn't set yet on the first
-//   update). The player's AC is the one in the MIN-NEAR band; NPCs only get the color when they spawn flames that close.
+// - DECIDING (shows nothing): no DLL (its color values read 0) -> STOCK; the player's flame -> CUSTOM; someone else's
+//   -> STOCK; still not known after 0.1 s -> STOCK (the DLL answers once the effect has a position).
 // - STOCK, CUSTOM: only end with the effect.
 function wrapper(stockId) {
-  const [min, near] = distancesFor(stockId)
-  const distance = `External(${EXT_CAMERA_DISTANCE})`
+  const playersFlame = `External(${EXT_PLAYERS_FLAME})`
   const terminate = `External(${EXT_TERMINATE}) >= 1 then terminate`
   const STOCK = 1, CUSTOM = 2
   const states = [
     State.from([
       terminate,
       `External(${EXT_ADD}) < 1 then ${STOCK}`,
-      `${distance} >= ${near} then ${STOCK}`,
-      `${distance} >= ${min} then ${CUSTOM}`,
+      `${playersFlame} >= 2 then ${CUSTOM}`,
+      `${playersFlame} >= 1 then ${STOCK}`,
       `StateTime > 0.1 then ${STOCK}`,
     ]),
     State.from([terminate]),

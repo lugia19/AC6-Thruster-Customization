@@ -19,6 +19,7 @@
 //! - 0x14045afc0 paint color writer: drops writes to the extra slot, whatever path they came from (paint sections only
 //!   have six colors; slot 9's address is the pattern bytes). Other slots pass through.
 //! - 0x142b56480 FXR external value read: the flames side, in thrusters.rs.
+//! - 0x141625930 an effect's per-frame camera distance: whether a flame is the player's, in player_flames.rs.
 //!
 //! Storage: the paint data (edit context +0x40) is 14 sections of 0x44 bytes, saved and carried by designs as one
 //! 0x3b8 block. The part categories (0x14045d960) only ever write sections 0-5, 8 and 11-13, so the menus never touch
@@ -27,6 +28,7 @@
 //!
 //! The menu needs a 7th color clip and the row's label text (build.py). Logs to Game\debug-logs\paint_menu.log.
 
+mod player_flames;
 mod thrusters;
 
 use std::fs::File;
@@ -71,6 +73,19 @@ pub(crate) fn log(msg: &str) {
     if let Some(mut f) = LOG.get().and_then(|l| l.lock().ok()) {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn ReadProcessMemory(process: isize, address: usize, buffer: *mut u8, size: usize, read: *mut usize) -> i32;
+}
+
+/// Reads memory that may not be mapped (pointer chains while loading, effects being freed) without faulting.
+pub(crate) fn read<T: Copy + Default>(addr: usize) -> Option<T> {
+    let mut v = T::default();
+    let mut n = 0;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr, &mut v as *mut T as *mut u8, size_of::<T>(), &mut n) };
+    (ok != 0 && n == size_of::<T>()).then_some(v)
 }
 
 /// A hooked function's original (its trampoline), typed as `F` (an `unsafe extern "system" fn`).
@@ -167,7 +182,7 @@ unsafe extern "system" fn write_colors_impl(paint: usize, parts: *const SlotRang
 pub(crate) type Hook = (usize, [u8; 6], *const (), &'static AtomicUsize);
 
 fn install() -> Result<(), String> {
-    let hooks: [Hook; 7] = [
+    let hooks: [Hook; 8] = [
         // push rbx / sub rsp,30
         (0x14045d300, [0x40, 0x53, 0x48, 0x83, 0xec, 0x30], slot_list_entry as *const (), &ORIG_SLOT_LIST),
         // movzx eax,byte [rcx] / cmp al,5
@@ -181,6 +196,7 @@ fn install() -> Result<(), String> {
         // mov [rsp+8],rbx
         (0x14045afc0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48], write_colors_impl as *const (), &ORIG_WRITE_COLORS),
         thrusters::hook(),
+        player_flames::hook(),
     ];
     for &(addr, bytes, _, _) in &hooks {
         let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, bytes.len()) };
@@ -216,6 +232,7 @@ fn init() {
         Ok(()) => {
             log("hooks installed");
             thrusters::start();
+            player_flames::start();
         }
         Err(e) => log(&format!("not hooked: {e}")),
     }

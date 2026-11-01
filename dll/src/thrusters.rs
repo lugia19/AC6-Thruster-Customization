@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::{Hook, STORAGE_COLOR_OFFSET, log, orig};
+use crate::{Hook, STORAGE_COLOR_OFFSET, log, orig, player_flames, read};
 
 const EXT_FIRST_CHANNEL: i32 = 900001;
 const CHANNEL_COUNT: usize = 9;
@@ -43,28 +43,24 @@ pub(crate) fn hook() -> Hook {
 }
 
 unsafe extern "system" {
-    fn GetCurrentProcess() -> isize;
-    fn ReadProcessMemory(process: isize, address: usize, buffer: *mut u8, size: usize, read: *mut usize) -> i32;
     fn GetModuleHandleW(name: *const u16) -> usize;
 }
 
-/// Reads memory that may not be mapped (pointer chains while loading) without faulting.
-fn read<T: Copy + Default>(addr: usize) -> Option<T> {
-    let mut v = T::default();
-    let mut n = 0;
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr, &mut v as *mut T as *mut u8, size_of::<T>(), &mut n) };
-    (ok != 0 && n == size_of::<T>()).then_some(v)
-}
-
 /// Called for every external value read of every effect. Our IDs don't need the game's lookup at all (nothing else
-/// provides them), so it's skipped for them.
+/// provides them), so it's skipped for them: the color channels, and whether the flame is the player's
+/// (player_flames.rs).
 unsafe extern "system" fn get_ext_value_impl(block: *mut u8, out: *mut u32, id: i32) -> *mut u32 {
-    let ours = (EXT_FIRST_CHANNEL..EXT_FIRST_CHANNEL + CHANNEL_COUNT as i32).contains(&id);
-    if !ours || out.is_null() {
+    let color = (EXT_FIRST_CHANNEL..EXT_FIRST_CHANNEL + CHANNEL_COUNT as i32).contains(&id);
+    let players_flame = id == player_flames::EXT_PLAYERS_FLAME;
+    if out.is_null() || !(color || players_flame) {
         return unsafe { orig::<GetExtValueFn>(&ORIG_GET_EXT_VALUE)(block, out, id) };
     }
-    let channel = (id - EXT_FIRST_CHANNEL) as usize;
-    unsafe { *out = CHANNELS[channel].load(Ordering::Relaxed) };
+    let value = if color {
+        CHANNELS[(id - EXT_FIRST_CHANNEL) as usize].load(Ordering::Relaxed)
+    } else {
+        player_flames::served_value(block as usize).to_bits()
+    };
+    unsafe { *out = value };
     out
 }
 
