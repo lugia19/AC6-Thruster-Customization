@@ -54,9 +54,25 @@ const EXTRA_SLOT: u8 = 9;
 static SLOTS: [u8; 7] = [0, 1, 2, 3, 4, 5, EXTRA_SLOT];
 static EXTRA_SLOT_LIST: [u8; 1] = [EXTRA_SLOT];
 // Where the extra row's color is kept in the paint data (colors are u32s of RGBA bytes).
-const STORAGE_SECTION: u8 = 9;
+// Section 7: of the sections the menus never write (6, 7, 9, 10), Sundance's Extension parts mod uses 10 (whose header
+// byte +6 also gets written along with section 4's in vanilla, seen in game); 7 stayed untouched in every byte.
+const STORAGE_SECTION: u8 = 7;
 const STORAGE_SLOT: u8 = 0;
 static STORAGE_SECTIONS: [u8; 1] = [STORAGE_SECTION];
+/// Alpha byte that marks the stored color as picked in the THRUSTER row. The game writes 0xFF into every color it stores
+/// (the unused sections hold its default grey, older saves can have black with 0), so 0xFE only ever comes from us. It
+/// travels with the color: saved with the AC and carried by designs.
+const PICKED_ALPHA: u8 = 0xFE;
+const ALPHA_MASK: u32 = 0xFF00_0000;
+/// The thruster color of an AC that never picked one: white (RGBA bytes, opaque).
+pub(crate) const DEFAULT_THRUSTER_COLOR: u32 = 0xFFFF_FFFF;
+
+/// The thruster color for a stored value, opaque, as both the Paint row and the flames use it: the stored color if it
+/// was picked in the THRUSTER row, otherwise DEFAULT_THRUSTER_COLOR.
+pub(crate) fn thruster_color(stored: u32) -> u32 {
+    let picked = (stored >> 24) as u8 == PICKED_ALPHA;
+    if picked { stored | ALPHA_MASK } else { DEFAULT_THRUSTER_COLOR }
+}
 /// Offset of the stored color from the start of a paint block (section size 0x44, colors at +8).
 pub(crate) const STORAGE_COLOR_OFFSET: usize = STORAGE_SECTION as usize * 0x44 + 8 + STORAGE_SLOT as usize * 4;
 const CTX_PAINT_OFFSET: usize = 0x40;
@@ -155,9 +171,11 @@ unsafe extern "system" fn set_color_impl(ctx: usize, slot: u8, color: u32) {
     if slot != EXTRA_SLOT {
         return unsafe { orig::<unsafe extern "system" fn(usize, u8, u32)>(&ORIG_SET_COLOR)(ctx, slot, color) };
     }
-    // The game's own writer (its trampoline, so past our guard), aimed at the storage section only.
+    // The game's own writer (its trampoline, so past our guard), aimed at the storage section only, with the alpha
+    // marking the color as picked.
     let paint = ctx_paint(ctx);
-    unsafe { orig::<WriteColorsFn>(&ORIG_WRITE_COLORS)(paint, &range(&STORAGE_SECTIONS), STORAGE_SLOT, color) };
+    let picked = (color & !ALPHA_MASK) | (PICKED_ALPHA as u32) << 24;
+    unsafe { orig::<WriteColorsFn>(&ORIG_WRITE_COLORS)(paint, &range(&STORAGE_SECTIONS), STORAGE_SLOT, picked) };
 }
 
 unsafe extern "system" fn get_color_impl(ctx: usize, out: *mut u32, slot: u8, category: u8) -> *mut u32 {
@@ -165,7 +183,8 @@ unsafe extern "system" fn get_color_impl(ctx: usize, out: *mut u32, slot: u8, ca
         type GetColorFn = unsafe extern "system" fn(usize, *mut u32, u8, u8) -> *mut u32;
         return unsafe { orig::<GetColorFn>(&ORIG_GET_COLOR)(ctx, out, slot, category) };
     }
-    unsafe { *out = *((ctx_paint(ctx) + STORAGE_COLOR_OFFSET) as *const u32) };
+    let stored = unsafe { *((ctx_paint(ctx) + STORAGE_COLOR_OFFSET) as *const u32) };
+    unsafe { *out = thruster_color(stored) };
     out
 }
 

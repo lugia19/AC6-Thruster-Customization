@@ -22,7 +22,7 @@ PACKAGE = os.path.join(ROOT, "package")
 
 # thrustersColorType N uses ThrustersSfxIdParam_PC column sfxIdN. Stock types 0-2 (orange, blue, Coral) get custom
 # types 3-5 (unused in vanilla), whose flames are wrappers that play the stock flame or custom copies tinted with the
-# player's color, depending on how close to the camera they spawn (see fxr/build_fxrs.mjs).
+# player's color, depending on whether they're on the player's AC (see fxr/build_fxrs.mjs, dll/src/player_flames.rs).
 STOCK_COLOR_TYPES = (0, 1, 2)
 CUSTOM_TYPE_SHIFT = 3
 # Player generators are 650xxxxx; the NPC versions (659xxxxx) are only used by special ACs and stay untouched.

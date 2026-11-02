@@ -10,8 +10,8 @@ boosting, quick boosting, assault boosting, all of it.
    It uses its own save, `PaintMenu.sl2`, which me3 copies from your real save on first launch.
 2. In the garage, Paint: there's a new THRUSTER row under DEVICE. It works like DEVICE, one color for the whole AC.
 
-The color is stored in the AC's paint data, so it's saved with the AC and carried by designs. An AC that never had
-one set (black) uses red. Dark colors work too: the flames darken what's behind them instead of glowing.
+The color is stored in the AC's paint data, so it's saved with the AC and carried by designs. Until you pick
+one, it's white. Dark colors work too: the flames darken what's behind them instead of glowing.
 
 ## Known issues
 
@@ -23,7 +23,7 @@ one set (black) uses red. Dark colors work too: the flames darken what's behind 
 
 - **Paint row.** The menu layout (`menu/02_coloring.gfx`) gets a 7th color row, patched in by `tools/gfx_place.py`.
   The DLL hooks the Paint screen so that row exists, edits as a single color, and reads and writes its color in a part
-  of the AC's paint data the game never uses (section 9, color slot 0).
+  of the AC's paint data the game never uses (section 7, color slot 0).
 - **Flames.** Every player generator gets a new thruster color type, whose flames are wrapper effects built by
   `fxr/build_fxrs.mjs`. Enemy ACs use the same generators, so when a wrapper spawns, it asks the DLL whether it's on
   your AC. The DLL compares the flame's position with yours and with every other AC's: it's yours if it's close to

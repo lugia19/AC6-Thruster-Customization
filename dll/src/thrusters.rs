@@ -2,7 +2,8 @@
 //! the paint block) through FXR external values, red, green, blue each: 900001-900003 what the additive copy of a flame
 //! adds, 900004-900006 what the subtractive copy removes from the background (both copies play together; see
 //! set_channels), 900007-900009 the plain color, for alpha-blended particles (smoke). Served as 1 + the amount (1..2),
-//! so 0 keeps meaning "no DLL" (the flames' wrappers then play stock).
+//! so 0 keeps meaning "no DLL" (the flames' wrappers then play stock). The color is lib.rs thruster_color: white
+//! until the player picks one.
 //!
 //! Effects read external values through 0x142b56480, effectively `float *get(value_block, float *out, int id)`.
 //!
@@ -13,13 +14,11 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::{Hook, STORAGE_COLOR_OFFSET, log, orig, player_flames, read};
+use crate::{DEFAULT_THRUSTER_COLOR, Hook, STORAGE_COLOR_OFFSET, log, orig, read, thruster_color};
 
 const EXT_FIRST_CHANNEL: i32 = 900001;
 const CHANNEL_COUNT: usize = 9;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-// 0xRRGGBB, for ACs whose thruster color was never set (section 9's colors are plain black then).
-const DEFAULT_COLOR: u32 = 0xFF3030;
 
 // GameDataMan's static pointer: `mov rax,[rip+x]` at the start of this pattern (CE table AC6_TGA v0.4.4).
 const GAME_DATA_MAN_PATTERN: [Option<u8>; 17] = [
@@ -34,6 +33,7 @@ static ORIG_GET_EXT_VALUE: AtomicUsize = AtomicUsize::new(0);
 // Served values for 900001-900009 (add, remove, plain: red, green, blue each), as f32 bits (see set_channels).
 static CHANNELS: [AtomicU32; CHANNEL_COUNT] = [const { AtomicU32::new(0) }; CHANNEL_COUNT];
 
+
 type GetExtValueFn = unsafe extern "system" fn(*mut u8, *mut u32, i32) -> *mut u32;
 
 /// The external value read hook, for lib.rs's hook table.
@@ -47,20 +47,14 @@ unsafe extern "system" {
 }
 
 /// Called for every external value read of every effect. Our IDs don't need the game's lookup at all (nothing else
-/// provides them), so it's skipped for them: the color channels, and whether the flame is the player's
-/// (player_flames.rs).
+/// provides them), so it's skipped for them.
 unsafe extern "system" fn get_ext_value_impl(block: *mut u8, out: *mut u32, id: i32) -> *mut u32 {
-    let color = (EXT_FIRST_CHANNEL..EXT_FIRST_CHANNEL + CHANNEL_COUNT as i32).contains(&id);
-    let players_flame = id == player_flames::EXT_PLAYERS_FLAME;
-    if out.is_null() || !(color || players_flame) {
+    let ours = (EXT_FIRST_CHANNEL..EXT_FIRST_CHANNEL + CHANNEL_COUNT as i32).contains(&id);
+    if !ours || out.is_null() {
         return unsafe { orig::<GetExtValueFn>(&ORIG_GET_EXT_VALUE)(block, out, id) };
     }
-    let value = if color {
-        CHANNELS[(id - EXT_FIRST_CHANNEL) as usize].load(Ordering::Relaxed)
-    } else {
-        player_flames::served_value(block as usize).to_bits()
-    };
-    unsafe { *out = value };
+    let channel = (id - EXT_FIRST_CHANNEL) as usize;
+    unsafe { *out = CHANNELS[channel].load(Ordering::Relaxed) };
     out
 }
 
@@ -148,11 +142,10 @@ fn set_channels(rgb: u32) {
     }
 }
 
-/// Stored color -> 0xRRGGBB, with unset (black) meaning the default.
+/// Stored color -> the thruster color as 0xRRGGBB.
 fn to_rgb(stored: u32) -> u32 {
-    let [r, g, b, _] = stored.to_le_bytes();
-    let rgb = (r as u32) << 16 | (g as u32) << 8 | b as u32;
-    if rgb == 0 { DEFAULT_COLOR } else { rgb }
+    let [r, g, b, _] = thruster_color(stored).to_le_bytes();
+    (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
 fn poll_loop() {
@@ -175,6 +168,6 @@ fn poll_loop() {
 }
 
 pub(crate) fn start() {
-    set_channels(DEFAULT_COLOR);
+    set_channels(to_rgb(DEFAULT_THRUSTER_COLOR));
     std::thread::spawn(poll_loop);
 }
