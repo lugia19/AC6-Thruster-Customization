@@ -149,8 +149,8 @@ function recolor(fxr, remove) {
 // is disabled (switching from stock to custom left the stock flame running under the custom one), so a wrapper may
 // only ever enable one of them. Conditions are checked in order, first match wins:
 // - DECIDING (shows nothing): no DLL (its color values read 0) -> STOCK; the player's flame -> CUSTOM; someone else's
-//   -> STOCK; still not known after 0.3 s -> STOCK (the DLL answers once the effect has a position; the wait only
-//   lasts while there's no answer, e.g. a load hitch).
+//   -> STOCK; still not known after 0.3 s -> STOCK (the DLL answers on the owner's next slot update, a frame after
+//   the spawn; the wait only lasts while there's no answer, e.g. a flame a cutscene spawned).
 // - STOCK, CUSTOM: only end with the effect.
 function wrapper(stockId) {
   const playersFlame = `External(${EXT_PLAYERS_FLAME})`

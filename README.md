@@ -26,9 +26,10 @@ one, it's white. Dark colors work too: the flames darken what's behind them inst
   of the AC's paint data the game never uses (section 7, color slot 0).
 - **Flames.** Every player generator gets a new thruster color type, whose flames are wrapper effects built by
   `fxr/build_fxrs.mjs`. Enemy ACs use the same generators, so when a wrapper spawns, it asks the DLL whether it's on
-  your AC. The DLL compares the flame's position with yours and with every other AC's: it's yours if it's close to
-  you and closer to you than to anyone else, so an enemy AC's flames stay stock even when it's touching you. Yours
-  play two recolored copies of the stock flame, one adding the color and one subtracting what the color lacks
+  your AC. The DLL knows exactly: every character drives its effects through its own slots, and the DLL tags each
+  flame with the owner of the slot that spawned it, so an enemy AC's flames stay stock even when it's touching you
+  (how this was found: AC6_tools `Research/thruster-ownership`). One pair of flames in the arena intro cutscene comes
+  from the cutscene rather than your AC and plays stock. Yours play two recolored copies of the stock flame, one adding the color and one subtracting what the color lacks
   (that's what makes dark colors work). It decides once and sticks to it, since a flame it already started keeps
   playing even if it switches.
 - **Color.** The DLL reads your color from the paint data and serves it to the flames as FXR external values, the

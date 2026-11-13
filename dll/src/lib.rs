@@ -19,7 +19,8 @@
 //! - 0x14045afc0 paint color writer: drops writes to the extra slot, whatever path they came from (paint sections only
 //!   have six colors; slot 9's address is the pattern bytes). Other slots pass through.
 //! - 0x142b56480 FXR external value read: the flames side, in thrusters.rs.
-//! - 0x141625930 an effect's per-frame camera distance: whether a flame is the player's, in player_flames.rs.
+//! - 0x140937cc0 / 0x14092bcd0 the two flame-carrying slot updates: whether a flame is the player's, in
+//!   player_flames.rs.
 //!
 //! Storage: the paint data (edit context +0x40) is 14 sections of 0x44 bytes, saved and carried by designs as one
 //! 0x3b8 block. The part categories (0x14045d960) only ever write sections 0-5, 8 and 11-13, so the menus never touch
@@ -201,7 +202,8 @@ unsafe extern "system" fn write_colors_impl(paint: usize, parts: *const SlotRang
 pub(crate) type Hook = (usize, [u8; 6], *const (), &'static AtomicUsize);
 
 fn install() -> Result<(), String> {
-    let hooks: [Hook; 8] = [
+    let [thruster_slot_update, multi_sfx_slot_update] = player_flames::hooks();
+    let hooks: [Hook; 9] = [
         // push rbx / sub rsp,30
         (0x14045d300, [0x40, 0x53, 0x48, 0x83, 0xec, 0x30], slot_list_entry as *const (), &ORIG_SLOT_LIST),
         // movzx eax,byte [rcx] / cmp al,5
@@ -215,7 +217,8 @@ fn install() -> Result<(), String> {
         // mov [rsp+8],rbx
         (0x14045afc0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48], write_colors_impl as *const (), &ORIG_WRITE_COLORS),
         thrusters::hook(),
-        player_flames::hook(),
+        thruster_slot_update,
+        multi_sfx_slot_update,
     ];
     for &(addr, bytes, _, _) in &hooks {
         let actual = unsafe { std::slice::from_raw_parts(addr as *const u8, bytes.len()) };
@@ -251,7 +254,6 @@ fn init() {
         Ok(()) => {
             log("hooks installed");
             thrusters::start();
-            player_flames::start();
         }
         Err(e) => log(&format!("not hooked: {e}")),
     }
