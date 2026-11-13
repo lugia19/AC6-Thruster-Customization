@@ -1,6 +1,6 @@
 profileVersion = "v1"
 
-# paint-menu: a THRUSTER color row in the Paint screen; player generators' flames take that color near the camera.
+# paint-menu: a THRUSTER color row in the Paint screen; the player's thruster flames take that color.
 # Paths are relative to this file (the package folder build.py writes).
 
 # Modded play uses its own save: me3 copies the real save to this file on first launch and never touches the original.

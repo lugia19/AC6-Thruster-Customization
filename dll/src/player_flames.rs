@@ -1,7 +1,7 @@
 //! Tells the flame wrappers (fxr/build_fxrs.mjs) whether they're on the player's AC: external value 900010 reads
 //! 0 = not known yet (or no DLL), 1 = someone else's, 2 = the player's. A wrapper decides once, at spawn.
 //!
-//! The answer comes from the slot that drives the flame (AC6_tools\Research\thruster-ownership). Every character
+//! The answer comes from the slot that drives the flame (docs/ownership.md). Every character
 //! updates its slots each frame as `update(slot, dt, ChrIns** owner)`; the flame-carrying ones keep their effects in a
 //! CSFD4MultiSfxIns. After the original update, the hooks attach 900010 to the slot's wrapper flames: PLAYERS when the
 //! owner is the player's ChrIns, SOMEONE_ELSES otherwise.

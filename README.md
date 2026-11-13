@@ -28,7 +28,7 @@ one, it's white. Dark colors work too: the flames darken what's behind them inst
   `fxr/build_fxrs.mjs`. Enemy ACs use the same generators, so when a wrapper spawns, it asks the DLL whether it's on
   your AC. The DLL knows exactly: every character drives its effects through its own slots, and the DLL tags each
   flame with the owner of the slot that spawned it, so an enemy AC's flames stay stock even when it's touching you
-  (how this was found: AC6_tools `Research/thruster-ownership`). One pair of flames in the arena intro cutscene comes
+  (details and how it was confirmed: [docs/ownership.md](docs/ownership.md)). One pair of flames in the arena intro cutscene comes
   from the cutscene rather than your AC and plays stock. Yours play two recolored copies of the stock flame, one adding the color and one subtracting what the color lacks
   (that's what makes dark colors work). It decides once and sticks to it, since a flame it already started keeps
   playing even if it switches.
